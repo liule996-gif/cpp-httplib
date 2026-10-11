@@ -22694,6 +22694,25 @@ protected:
     return collect("/parse");
   }
 
+  // Each write is a separate HTTP chunk, so CRLF and UTF-8 sequences can be
+  // split across reads without depending on socket timing.
+  std::vector<sse::SSEMessage> parse_chunks(std::vector<std::string> chunks) {
+    chunks.push_back("event: end\ndata: end\n\n");
+    server_->Get("/parse-chunks", [chunks](const Request &, Response &res) {
+      auto index = std::make_shared<size_t>(0);
+      res.set_chunked_content_provider(
+          "text/event-stream", [chunks, index](size_t, DataSink &sink) {
+            if (*index < chunks.size()) {
+              const auto &chunk = chunks[(*index)++];
+              return sink.write(chunk.data(), chunk.size());
+            }
+            sink.done();
+            return true;
+          });
+    });
+    return collect("/parse-chunks");
+  }
+
   // Runs SSEClient against path until an "end" event arrives and returns the
   // messages dispatched before it
   std::vector<sse::SSEMessage> collect(const std::string &path) {
@@ -22791,6 +22810,64 @@ TEST_F(SSEParsingTest, FieldNameOnlyWithCarriageReturn) {
   auto msgs = parse("data\r\n\r\n");
   ASSERT_EQ(msgs.size(), 1u);
   EXPECT_EQ(msgs[0].data, "");
+}
+
+TEST_F(SSEParsingTest, CarriageReturnOnly) {
+  auto msgs = parse("data: hello\r\r");
+  ASSERT_EQ(msgs.size(), 1u);
+  EXPECT_EQ(msgs[0].data, "hello");
+  EXPECT_EQ(msgs[0].event, "message");
+}
+
+TEST_F(SSEParsingTest, MixedLineEndings) {
+  auto msgs = parse(": comment\rid: 42\r\nevent: update\n"
+                    "data: first\rdata: second\n\r"
+                    "data: third\r\n\r\n");
+  ASSERT_EQ(msgs.size(), 2u);
+  EXPECT_EQ(msgs[0].id, "42");
+  EXPECT_EQ(msgs[0].event, "update");
+  EXPECT_EQ(msgs[0].data, "first\nsecond");
+  EXPECT_EQ(msgs[1].event, "message");
+  EXPECT_EQ(msgs[1].data, "third");
+}
+
+TEST_F(SSEParsingTest, EmptyDataWithCarriageReturnOnly) {
+  auto msgs = parse("data\r\rdata:\rdata: hello\r\r");
+  ASSERT_EQ(msgs.size(), 2u);
+  EXPECT_EQ(msgs[0].data, "");
+  EXPECT_EQ(msgs[1].data, "\nhello");
+}
+
+TEST_F(SSEParsingTest, SplitCarriageReturnLineFeed) {
+  auto msgs = parse_chunks({"data: first\r", "\ndata: second\r", "\n\r",
+                            "\ndata: third\r", "\n\r", "\n"});
+  ASSERT_EQ(msgs.size(), 2u);
+  EXPECT_EQ(msgs[0].data, "first\nsecond");
+  EXPECT_EQ(msgs[1].data, "third");
+}
+
+TEST_F(SSEParsingTest, SplitCarriageReturnOnly) {
+  auto msgs = parse_chunks(
+      {"data: first\r", "data: second\r", "\r", "data: third\r", "\r"});
+  ASSERT_EQ(msgs.size(), 2u);
+  EXPECT_EQ(msgs[0].data, "first\nsecond");
+  EXPECT_EQ(msgs[1].data, "third");
+}
+
+TEST_F(SSEParsingTest, BytewiseMixedLineEndingsAndByteOrderMark) {
+  const std::string stream = "\xEF\xBB\xBF"
+                             "event: update\r\ndata: first\r"
+                             "data: second\n\rdata: third\r\n\r\n";
+  std::vector<std::string> chunks;
+  for (auto c : stream) {
+    chunks.emplace_back(1, c);
+  }
+  auto msgs = parse_chunks(chunks);
+  ASSERT_EQ(msgs.size(), 2u);
+  EXPECT_EQ(msgs[0].event, "update");
+  EXPECT_EQ(msgs[0].data, "first\nsecond");
+  EXPECT_EQ(msgs[1].event, "message");
+  EXPECT_EQ(msgs[1].data, "third");
 }
 
 TEST_F(SSEParsingTest, LeadingByteOrderMarkIgnored) {
@@ -23000,6 +23077,33 @@ TEST_F(SSEIntegrationTest, OnEventForSpecificTypes) {
 
   EXPECT_TRUE(update_received.load());
   EXPECT_TRUE(delete_received.load());
+}
+
+TEST_F(SSEIntegrationTest, CarriageReturnDispatchesWithoutNextChunk) {
+  Client client(HOST, get_port());
+  sse::SSEClient sse(client, "/events");
+  std::mutex mutex;
+  std::condition_variable cv;
+  std::vector<std::string> received;
+  sse.on_message([&](const sse::SSEMessage &msg) {
+    std::lock_guard<std::mutex> lock(mutex);
+    received.push_back(msg.data);
+    cv.notify_all();
+  });
+  sse.start_async();
+  send_event("data: hello\r\r");
+
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    cv.wait_for(lock, std::chrono::seconds(2),
+                [&] { return !received.empty(); });
+  }
+  stop_server_.store(true);
+  event_cv_.notify_all();
+  sse.stop();
+
+  ASSERT_EQ(received.size(), 1u);
+  EXPECT_EQ(received[0], "hello");
 }
 
 // Test: on_error callback on connection failure

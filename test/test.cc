@@ -17778,6 +17778,99 @@ TEST(SSLClientRedirectTest, CaCertStoreReplacesEarlierPem) {
 #endif
 #endif
 
+TEST(TaskQueueTest, DynamicPoolStartsBurstWithoutWaitingForRunningTasks) {
+  // Repeat with a fresh pool to exercise the race between enqueueing a burst
+  // and notified idle workers taking their first jobs.
+  for (int round = 0; round < 8; ++round) {
+    SCOPED_TRACE(round);
+    constexpr size_t task_count = 16;
+    ThreadPool pool(1, task_count);
+    std::mutex mutex;
+    std::condition_variable cv;
+    size_t started = 0;
+    bool release = false;
+    std::promise<void> warmed_up;
+    auto ready = warmed_up.get_future();
+    auto cleanup = detail::scope_exit([&] {
+      {
+        std::lock_guard<std::mutex> lock(mutex);
+        release = true;
+      }
+      cv.notify_all();
+      pool.shutdown();
+    });
+
+    ASSERT_TRUE(pool.enqueue([&] { warmed_up.set_value(); }));
+    ASSERT_EQ(std::future_status::ready,
+              ready.wait_for(std::chrono::seconds(5)));
+    // Allow the warm-up worker to return to its idle wait before the burst.
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    for (size_t i = 0; i < task_count; ++i) {
+      ASSERT_TRUE(pool.enqueue([&] {
+        std::unique_lock<std::mutex> lock(mutex);
+        ++started;
+        cv.notify_all();
+        cv.wait(lock, [&] { return release; });
+      }));
+    }
+
+    std::unique_lock<std::mutex> lock(mutex);
+    auto all_started = cv.wait_for(lock, std::chrono::seconds(5),
+                                   [&] { return started == task_count; });
+    auto started_before_release = started;
+    lock.unlock();
+    // All jobs fit in the pool. None should need another job to finish first.
+    ASSERT_TRUE(all_started) << started_before_release << "/" << task_count
+                             << " tasks started before release";
+  }
+}
+
+TEST(TaskQueueTest, DynamicPoolPreservesQueueAndThreadLimits) {
+  ThreadPool pool(1, 2, 1);
+  std::mutex mutex;
+  std::condition_variable cv;
+  size_t started = 0;
+  size_t completed = 0;
+  bool release = false;
+  auto cleanup = detail::scope_exit([&] {
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      release = true;
+    }
+    cv.notify_all();
+    pool.shutdown();
+  });
+  auto job = [&] {
+    std::unique_lock<std::mutex> lock(mutex);
+    ++started;
+    cv.notify_all();
+    cv.wait(lock, [&] { return release; });
+    ++completed;
+  };
+
+  // Occupy each worker before enqueueing the next job, so the one-slot
+  // queue limit does not reject the jobs intended to grow the pool.
+  for (size_t i = 1; i <= 2; ++i) {
+    ASSERT_TRUE(pool.enqueue(job));
+    std::unique_lock<std::mutex> lock(mutex);
+    ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(5),
+                            [&] { return started == i; }));
+  }
+  ASSERT_TRUE(pool.enqueue(job));
+  EXPECT_FALSE(pool.enqueue(job));
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    EXPECT_EQ(2u, started);
+    release = true;
+  }
+  cv.notify_all();
+  pool.shutdown();
+  cleanup.release();
+  EXPECT_EQ(3u, started);
+  EXPECT_EQ(3u, completed);
+}
+
 #ifdef CPPHTTPLIB_SSL_ENABLED
 // Test that set_ca_cert_store() skips system certs (consistent with
 // set_ca_cert_path behavior). When a custom cert store is set, only those certs

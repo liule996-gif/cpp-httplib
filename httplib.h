@@ -5212,8 +5212,10 @@ inline void SSEClient::run_event_loop() {
           // An event without a data field is not dispatched
           if (has_data) { dispatch_event(current_msg); }
 
-          // Reset the message for the next event either way
-          current_msg.clear();
+          // Reset data and type, but keep the stream's ID buffer until another
+          // id field changes or clears it (WHATWG SSE dispatch algorithm).
+          current_msg.event = "message";
+          current_msg.data.clear();
           has_data = false;
           has_id = false;
         }

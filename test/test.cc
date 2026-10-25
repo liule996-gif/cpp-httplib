@@ -25722,6 +25722,50 @@ TEST_F(SSEParsingTest, EmptyEventId) {
   EXPECT_EQ(msgs[0].id, "");
 }
 
+TEST_F(SSEParsingTest, EventIdPersistsAcrossMessages) {
+  auto msgs = parse("data: initial\n\n"
+                    "event: update\nid: 42\ndata: first\n\n"
+                    "data: second\n\n"
+                    "id: 43\ndata: third\n\n"
+                    "data: fourth\n\n");
+  ASSERT_EQ(msgs.size(), 5u);
+  EXPECT_EQ(msgs[0].id, "");
+  EXPECT_EQ(msgs[1].id, "42");
+  EXPECT_EQ(msgs[1].event, "update");
+  EXPECT_EQ(msgs[2].id, "42");
+  EXPECT_EQ(msgs[2].event, "message");
+  EXPECT_EQ(msgs[2].data, "second");
+  EXPECT_EQ(msgs[3].id, "43");
+  EXPECT_EQ(msgs[4].id, "43");
+  EXPECT_EQ(msgs[4].data, "fourth");
+}
+
+TEST_F(SSEParsingTest, IdOnlyBlockSetsFollowingMessageId) {
+  auto msgs = parse("id: 42\n\n: keep-alive\n\n\n"
+                    "data: first\n\ndata: second\n\n");
+  ASSERT_EQ(msgs.size(), 2u);
+  EXPECT_EQ(msgs[0].id, "42");
+  EXPECT_EQ(msgs[1].id, "42");
+}
+
+TEST_F(SSEParsingTest, IgnoredIdPreservesMessageId) {
+  auto msgs = parse(std::string("id: 42\ndata: first\n\nid: a") + '\0' +
+                    "b\ndata: second\n\n");
+  ASSERT_EQ(msgs.size(), 2u);
+  EXPECT_EQ(msgs[0].id, "42");
+  EXPECT_EQ(msgs[1].id, "42");
+  EXPECT_EQ(msgs[1].data, "second");
+}
+
+TEST_F(SSEParsingTest, IdOnlyBlockClearsFollowingMessageId) {
+  auto msgs = parse("id: 42\ndata: first\n\nid:\n\n"
+                    "data: second\n\ndata: third\n\n");
+  ASSERT_EQ(msgs.size(), 3u);
+  EXPECT_EQ(msgs[0].id, "42");
+  EXPECT_EQ(msgs[1].id, "");
+  EXPECT_EQ(msgs[2].id, "");
+}
+
 TEST_F(SSEParsingTest, CommentsIgnored) {
   auto msgs = parse(": this is a comment\ndata: hello\n\n");
   ASSERT_EQ(msgs.size(), 1u);
@@ -25844,6 +25888,8 @@ TEST_F(SSEParsingTest, EventWithoutDataUpdatesLastEventId) {
   auto msgs = collect("/id-only");
   ASSERT_EQ(msgs.size(), 1u);
   EXPECT_EQ(msgs[0].data, "42");
+  // A new stream starts with an empty ID buffer, independently of the header.
+  EXPECT_EQ(msgs[0].id, "");
 }
 
 TEST_F(SSEParsingTest, EmptyEventIdClearsLastEventId) {

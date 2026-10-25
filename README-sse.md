@@ -37,6 +37,10 @@ struct SSEMessage {
 };
 ```
 
+Within an event stream, `id` retains the last accepted `id` field, including
+when a later message omits it or an ID-only block sets it. An empty `id` field
+clears it. The event type and data are reset between messages.
+
 ### SSEClient
 
 #### Constructor

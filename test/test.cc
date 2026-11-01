@@ -26629,6 +26629,72 @@ TEST_F(SSEIntegrationTest, TooLongEventEndsTheConnection) {
   EXPECT_TRUE(too_long);
 }
 
+// The final data line and the blank line may arrive in the same read. Check
+// the event before it can be dispatched and cleared.
+class SSEEventLengthTest : public SSEIntegrationTest {
+protected:
+  void check_length(size_t last_line_length, bool complete, bool rejected) {
+    const auto limit = static_cast<size_t>(CPPHTTPLIB_SSE_MAX_EVENT_LENGTH);
+    if (limit < 64) {
+      GTEST_SKIP() << "This test needs an event length limit of at least 64";
+    }
+
+    auto body = std::string("id: before\ndata: ok\n\n") +
+                "id: oversized\ndata: " + std::string(limit - 64, 'A') +
+                "\ndata: " + std::string(last_line_length, 'B') + "\n";
+    if (complete) { body += "\nid: after\ndata: after\n\n"; }
+
+    std::atomic<int> requests{0};
+    server_->Get("/event-length", [&](const Request &, Response &res) {
+      if (++requests == 1) {
+        res.set_content(body, "text/event-stream");
+      } else {
+        // End a successful stream's reconnect without a timing-based stop().
+        res.status = StatusCode::NoContent_204;
+      }
+    });
+
+    Client client(HOST, get_port());
+    sse::SSEClient sse(client, "/event-length");
+    std::vector<size_t> lengths;
+    auto too_large = 0;
+    sse.on_message([&](const sse::SSEMessage &msg) {
+      lengths.push_back(msg.data.size());
+    });
+    sse.on_error([&](Error err) {
+      if (err == Error::ExceedMaxPayloadSize) { ++too_large; }
+    });
+    sse.set_reconnect_interval(100);
+    sse.set_max_reconnect_attempts(1);
+    sse.start();
+
+    if (rejected) {
+      EXPECT_EQ((std::vector<size_t>{2}), lengths);
+      EXPECT_EQ(1, too_large);
+      EXPECT_EQ(1, requests.load());
+      EXPECT_EQ("before", sse.last_event_id());
+    } else {
+      EXPECT_EQ((std::vector<size_t>{2, limit, 5}), lengths);
+      EXPECT_EQ(0, too_large);
+      EXPECT_EQ(2, requests.load());
+      EXPECT_EQ("after", sse.last_event_id());
+    }
+  }
+};
+
+TEST_F(SSEEventLengthTest, CompleteEventOverLimitIsNotDispatched) {
+  // The newline inserted between data lines is part of the payload.
+  check_length(64, true, true);
+}
+
+TEST_F(SSEEventLengthTest, IncompleteEventOverLimitEndsTheConnection) {
+  check_length(64, false, true);
+}
+
+TEST_F(SSEEventLengthTest, CompleteEventAtLimitIsDispatched) {
+  check_length(63, true, false);
+}
+
 TEST_F(SSEIntegrationTest, PayloadLimitDoesNotEndTheStream) {
   // Far more in all than the client's payload limit below.
   server_->Get("/many-events", [](const Request &, Response &res) {

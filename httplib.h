@@ -5247,6 +5247,14 @@ inline void SSEClient::run_event_loop() {
         auto event_complete = parse_sse_line(
             line, current_msg, reconnect_interval_ms_, has_data, has_id);
 
+        // Check before a blank line can dispatch and clear the event in this
+        // same read. Checking only the leftover buffer misses a complete event.
+        if (CPPHTTPLIB_SSE_MAX_EVENT_LENGTH > 0 &&
+            current_msg.data.size() > CPPHTTPLIB_SSE_MAX_EVENT_LENGTH) {
+          event_too_long = true;
+          break;
+        }
+
         if (event_complete) {
           // Update last_event_id for reconnection, even for an event that
           // has no data. An empty id clears it.
@@ -5270,9 +5278,9 @@ inline void SSEClient::run_event_loop() {
 
       // Neither an event nor a line still waiting for its end may grow
       // without bound. 0 means no limit.
-      if (CPPHTTPLIB_SSE_MAX_EVENT_LENGTH > 0 &&
-          buffer.size() + current_msg.data.size() >
-              CPPHTTPLIB_SSE_MAX_EVENT_LENGTH) {
+      if (event_too_long || (CPPHTTPLIB_SSE_MAX_EVENT_LENGTH > 0 &&
+                             buffer.size() + current_msg.data.size() >
+                                 CPPHTTPLIB_SSE_MAX_EVENT_LENGTH)) {
         if (on_error_) { on_error_(Error::ExceedMaxPayloadSize); }
         event_too_long = true;
         break;

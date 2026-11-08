@@ -8645,7 +8645,8 @@ TEST_F(ServerTest, GetStreamedWithRangeSuffix1) {
 TEST_F(ServerTest, GetStreamedWithRangeSuffix2) {
   // RFC 9110 14.1.2: a suffix-length longer than the representation selects
   // the entire representation.
-  for (auto range : {"bytes=-8", "bytes=-9999"}) {
+  for (auto range :
+       {"bytes=-8", "bytes=-9999", "bytes=-999999999999999999999999999999"}) {
     auto res = cli_.Get("/streamed-with-range", Headers{{"Range", range}});
     ASSERT_TRUE(res) << "Error: " << to_string(res.error());
     EXPECT_EQ(StatusCode::PartialContent_206, res->status) << range;

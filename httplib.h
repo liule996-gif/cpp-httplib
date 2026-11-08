@@ -9578,11 +9578,15 @@ inline bool parse_range_header(const std::string &s, Ranges &ranges) try {
 
       ssize_t last = -1;
       if (!rhs.empty()) {
-        // An overflowing last-byte-pos is past any content length, so keeping
-        // -1 ("remainder", RFC 9110 14.1.2) is correct here.
+        // An overflowing last-byte-pos means the remainder. An overflowing
+        // suffix-length selects the entire representation (RFC 9110 14.1.2).
         ssize_t v;
         auto res = detail::from_chars(rhs.data(), rhs.data() + rhs.size(), v);
-        if (res.ec == std::errc{}) { last = v; }
+        if (res.ec == std::errc{}) {
+          last = v;
+        } else if (first == -1 && res.ec == std::errc::result_out_of_range) {
+          last = (std::numeric_limits<ssize_t>::max)();
+        }
       }
 
       if ((first == -1 && last == -1) ||
